@@ -27,21 +27,10 @@ setInterval(() => {
 }, 5000);
 
 // === HELPERS ===
-function isOwner(id) {
-  return id === OWNER;
-}
-
-function isAdmin(id) {
-  return db.admins.includes(id);
-}
-
-function hasAccess(id) {
-  return isOwner(id) || isAdmin(id) || (db.users[id] && db.users[id].is_whitelisted);
-}
-
-function usdToMmk(usd) {
-  return usd * USD_TO_MMK;
-}
+function isOwner(id) { return id === OWNER; }
+function isAdmin(id) { return db.admins.includes(id); }
+function hasAccess(id) { return isOwner(id) || isAdmin(id) || (db.users[id] && db.users[id].is_whitelisted); }
+function usdToMmk(usd) { return usd * USD_TO_MMK; }
 
 async function callAPI(params) {
   const res = await fetch('https://shweboost.com/api/v2', {
@@ -52,33 +41,26 @@ async function callAPI(params) {
   return await res.json();
 }
 
-// Get group owner ID dynamically from Telegram API
 async function getGroupOwnerId(ctx) {
   if (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup') return null;
   try {
     const admins = await ctx.telegram.getChatAdministrators(ctx.chat.id);
     const owner = admins.find(adm => adm.status === 'creator');
     return owner ? owner.user.id : null;
-  } catch (e) {
-    console.error('Error fetching chat administrators:', e);
-    return null;
-  }
+  } catch (e) { console.error(e); return null; }
 }
 
-// Middleware helper: only group owner can run group commands
 async function groupOwnerOnly(ctx, next) {
   const ownerId = await getGroupOwnerId(ctx);
   if (ownerId === ctx.from.id) return next();
 }
-
-// Middleware helper: only owner in private chat for sensitive commands
 function ownerOnlyPrivate(ctx, next) {
   if (ctx.chat.type !== 'private') return;
   if (!isOwner(ctx.from.id)) return;
   return next();
 }
 
-// === OWNER-ONLY COMMANDS IN PRIVATE CHAT ===
+// === OWNER/ADMIN COMMANDS ===
 bot.command('post', ctx => ownerOnlyPrivate(ctx, () => {
   const [s, serviceId, name] = ctx.message.text.split(' ');
   if (!serviceId || !name) return ctx.reply('Usage: /post <service_id> <name>');
@@ -145,14 +127,10 @@ bot.command('send', ctx => ownerOnlyPrivate(ctx, () => {
 bot.command('broadcast', ctx => ownerOnlyPrivate(async () => {
   const text = ctx.message.text.replace('/broadcast', '').trim();
   if (!text) return ctx.reply('❌ Usage: /broadcast <message>');
-
   let count = 0;
   for (const [uid, user] of Object.entries(db.users)) {
     if (user.is_whitelisted) {
-      try {
-        await bot.telegram.sendMessage(Number(uid), `📢 ${text}`);
-        count++;
-      } catch {}
+      try { await bot.telegram.sendMessage(Number(uid), `📢 ${text}`); count++; } catch {}
     }
   }
   ctx.reply(`✅ Broadcast sent to ${count} users.`);
@@ -163,12 +141,10 @@ bot.command('load', ctx => ownerOnlyPrivate(ctx, () => {
     { name: "view", service_id: "258", price: 50 },
     { name: "like", service_id: "182", price: 1000 },
   ];
-
   presets.forEach(({ name, service_id, price }) => {
     db.services[name] = { service_id, price_mmk: price };
     if (!db.whitelist.includes(name)) db.whitelist.push(name);
   });
-
   ctx.reply("✅ Preset services loaded:\n- view (500 MMK/10k)\n- like (1000 MMK/1k)");
 }));
 
@@ -176,104 +152,95 @@ bot.command('promote', ctx => ownerOnlyPrivate(ctx, () => {
   const [cmd, idStr] = ctx.message.text.split(' ');
   const id = Number(idStr);
   if (!id) return ctx.reply('❌ Invalid TG ID.');
-  if (!db.admins.includes(id)) {
-    db.admins.push(id);
-    ctx.reply(`✅ User ${id} promoted to admin.`);
-  } else {
-    ctx.reply(`ℹ️ User ${id} is already an admin.`);
-  }
+  if (!db.admins.includes(id)) db.admins.push(id);
+  ctx.reply(`✅ User ${id} promoted to admin.`);
 }));
 
 bot.command('demote', ctx => ownerOnlyPrivate(ctx, () => {
   const [cmd, idStr] = ctx.message.text.split(' ');
   const id = Number(idStr);
-  if (!id) return ctx.reply('❌ Invalid TG ID.');
   db.admins = db.admins.filter(adminId => adminId !== id);
   ctx.reply(`✅ User ${id} demoted from admin.`);
 }));
 
 bot.command('userlist', ctx => ownerOnlyPrivate(ctx, () => {
   const userIds = Object.keys(db.users);
-  if (userIds.length === 0) return ctx.reply('ℹ️ No users found.');
+  if (!userIds.length) return ctx.reply('ℹ️ No users found.');
   ctx.reply('👥 User IDs:\n' + userIds.join('\n'));
 }));
 
-// === NEW /fetch & /listowners commands ===
 bot.command('fetch', ctx => ownerOnlyPrivate(ctx, () => {
   const parts = ctx.message.text.split(' ');
   if (parts.length < 3) return ctx.reply('❌ Usage: /fetch <owner_tg_id> <owner_username>');
-  const ownerId = parts[1];
-  const ownerUsername = parts[2].startsWith('@') ? parts[2] : '@' + parts[2];
+  const ownerId = parts[1], ownerUsername = parts[2].startsWith('@') ? parts[2] : '@' + parts[2];
   db.groupOwners[ownerId] = ownerUsername;
   ctx.reply(`✅ Stored group owner info:\nID: ${ownerId}\nUsername: ${ownerUsername}`);
 }));
 
 bot.command('listowners', ctx => ownerOnlyPrivate(ctx, () => {
   const owners = db.groupOwners;
-  if (!owners || Object.keys(owners).length === 0) return ctx.reply('ℹ️ No group owners stored yet.');
+  if (!owners || !Object.keys(owners).length) return ctx.reply('ℹ️ No group owners stored yet.');
   let msg = '📋 Stored Group Owners:\n';
   for (const [id, username] of Object.entries(owners)) msg += `ID: ${id}, Username: ${username}\n`;
   ctx.reply(msg);
 }));
 
-// === MULTI-ORDER /add command ===
+// === GROUP COMMANDS ===
 bot.command('add', async ctx => {
   if (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup') return;
 
   await groupOwnerOnly(ctx, async () => {
-    const text = ctx.message.text.split(' ').slice(1).join(' ').trim();
-    if (!text) return ctx.reply('❌ Usage: /add <link1> <service1> <qty1>, <link2> <service2> <qty2>, ...');
+    const parts = ctx.message.text.split(' ').slice(1); // remove '/add'
+    if (!parts.length) return ctx.reply('❌ Usage: /add <link> <product_name> <qty> / <product_name> <qty> ...');
 
-    const ordersRaw = text.split(',');
     const orders = [];
+    let link = parts.shift();
+    while (parts.length) {
+      const [nameQty, ...rest] = parts;
+      const [name, qty] = nameQty.split('/');
+      const qtyNum = Number(qty || rest.shift());
+      if (!name || !qtyNum) break;
+      orders.push({ name, qty: qtyNum });
+    }
+
+    let receipt = `🛒 Order Summary:\n----------------\n`;
     let totalCost = 0;
 
-    for (let raw of ordersRaw) {
-      const parts = raw.trim().split(' ');
-      if (parts.length < 3) return ctx.reply(`❌ Invalid order format: ${raw}`);
-      const [link, name, qtyStr] = parts;
-      const qty = Number(qtyStr);
-      if (!link || !name || !qty || qty <= 0) return ctx.reply(`❌ Invalid order details: ${raw}`);
+    for (const { name, qty } of orders) {
+      if (!db.services[name]) {
+        receipt += `❌ Unknown service '${name}'\n`;
+        continue;
+      }
+      if (!db.whitelist.includes(name) && !isOwner(ctx.from.id)) {
+        receipt += `❌ '${name}' not allowed\n`;
+        continue;
+      }
 
-      if (!db.whitelist.includes(name) && !isOwner(ctx.from.id)) return ctx.reply(`❌ '${name}' is not allowed.`);
       const svc = db.services[name];
-      if (!svc) return ctx.reply(`❌ Unknown service: ${name}`);
-
       const cost = (svc.price_mmk * qty) / 1000;
       totalCost += cost;
-      orders.push({ link, name, qty, service_id: svc.service_id, cost });
-    }
 
-    if (!isOwner(ctx.from.id)) {
-      const user = db.users[ctx.from.id] = db.users[ctx.from.id] || { balance: 0, is_whitelisted: false };
-      if (user.balance < totalCost) return ctx.reply(`❌ Insufficient balance. Required: ${totalCost} MMK`);
-      user.balance -= totalCost;
-    }
-
-    const receipts = [];
-    for (let order of orders) {
-      try {
-        const res = await callAPI({
-          action: 'add',
-          service: order.service_id,
-          link: order.link,
-          quantity: order.qty
-        });
-        receipts.push(`Order ID: ${res.order}\nService: ${order.name}\nLink: ${order.link}\nQuantity: ${order.qty}\nCost: ${order.cost} MMK`);
-      } catch (e) {
-        receipts.push(`❌ Failed to place order for ${order.name} (${order.link})`);
+      // Deduct balance if not owner
+      if (!isOwner(ctx.from.id)) {
+        const user = db.users[ctx.from.id] = db.users[ctx.from.id] || { balance: 0, is_whitelisted: false };
+        if (user.balance < cost) {
+          receipt += `❌ Insufficient balance for '${name}'\n`;
+          continue;
+        }
+        user.balance -= cost;
       }
-    }
 
-    const receiptMsg = `📋 Orders placed successfully ✅\n-----------------------\n${receipts.join('\n-----------------------\n')}\n\n💰 Total cost: ${totalCost} MMK\n----Sunflower----\nOwner - @Shiao_Riua🌻`;
-    ctx.reply(receiptMsg);
+      const res = await callAPI({ action: 'add', service: svc.service_id, link, quantity: qty });
+      receipt += `✅ ${name} x${qty} — ${cost} MMK — Order ID: ${res.order}\n`;
+    }
+    receipt += `----------------\nTotal Cost: ${totalCost} MMK`;
+    ctx.reply(receipt);
   });
 });
 
-// === STATUS / ORDERS commands (group only) ===
+// Status & orders commands
 bot.command('status', async ctx => {
   if (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup') return;
-
   await groupOwnerOnly(ctx, async () => {
     const id = ctx.message.text.split(' ')[1];
     if (!id) return ctx.reply('❌ Usage: /status <order_id>');
@@ -285,164 +252,101 @@ bot.command('status', async ctx => {
 
 bot.command('orders', async ctx => {
   if (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup') return;
-
   await groupOwnerOnly(ctx, async () => {
     const idsText = ctx.message.text.split(' ')[1];
     if (!idsText) return ctx.reply('❌ Usage: /orders <id1,id2,...>');
     const ids = idsText.split(',');
     const parts = [];
-
     for (let id of ids) {
       try {
         const res = await callAPI({ action: 'status', order: id });
         const mmk = usdToMmk(Number(res.charge));
         parts.push(`ID ${id}: ${res.status}, ${mmk} MMK`);
-      } catch (e) {
-        parts.push(`ID ${id}: Error fetching status`);
-      }
+      } catch { parts.push(`ID ${id}: Error fetching status`); }
     }
-
     ctx.reply(parts.join('\n'));
   });
 });
 
-// === PRIVATE HELP & SERVICE COMMANDS ===
-bot.command('services', ctx => ownerOnlyPrivate(ctx, () => {
-  if (Object.keys(db.services).length === 0) return ctx.reply('ℹ️ No services available.');
-  const lines = Object.entries(db.services).map(([name, svc]) => {
-    const display = name === 'view'
-      ? `${svc.price_mmk * 10} MMK /10k`
-      : `${svc.price_mmk} MMK /1k`;
-    return `${name} — ${display}`;
-  });
-  ctx.reply('📦 Services:\n' + lines.join('\n'));
-}));
-
-bot.command('wl_list', ctx => ownerOnlyPrivate(ctx, () => {
-  if (db.whitelist.length === 0) return ctx.reply('ℹ️ No whitelisted services.');
-  ctx.reply(`✅ Whitelisted services:\n${db.whitelist.join('\n')}`);
-}));
-
-bot.command('balance', async ctx => {
-  if (ctx.chat.type !== 'private') return;
-
-  const id = ctx.from.id;
-
-  if (isOwner(id) || isAdmin(id)) {
-    const res = await callAPI({ action: 'balance' });
-    let msg = `💰 API balance: ${usdToMmk(Number(res.balance))} MMK\n\n📊 Users:\n`;
-    for (const [uid, user] of Object.entries(db.users)) msg += `${uid}: ${user.balance} MMK\n`;
-    return ctx.reply(msg);
-  }
-
-  const user = db.users[id];
-  const bal = user ? user.balance : 0;
-  ctx.reply(`💰 Your balance: ${bal} MMK`);
-});
-
-// === START & RECHARGE FLOW ===
-const rechargeSessions = {};
-
+// === USER COMMANDS ===
 bot.start(async ctx => {
   if (ctx.chat.type !== 'private') return;
-  const id = ctx.from.id;
-  const username = ctx.from.username || '(no username)';
-
+  const id = ctx.from.id, username = ctx.from.username || '(no username)';
   if (!db.users[id]) {
     db.users[id] = { balance: 0, is_whitelisted: true };
     if (!db.whitelist.includes(id)) db.whitelist.push(id);
-
-    const adminsAndOwner = [...db.admins, OWNER];
-    for (const adminId of adminsAndOwner) {
+    [...db.admins, OWNER].forEach(async adminId => {
       try { await ctx.telegram.sendMessage(adminId, `👤 New user whitelisted:\nID: ${id}\nUsername: @${username}`); } catch {}
-    }
-
+    });
     return ctx.reply('🎉 သင်သည် whitelist သို့ထည့်သွင်းပြီးဖြစ်ပါသည်။\n\nကျေးဇူးပြု၍ /recharge command ဖြင့် balance ထည့်ပါ။');
   }
-
   const user = db.users[id];
-  if (!user.is_whitelisted) {
-    user.is_whitelisted = true;
-    if (!db.whitelist.includes(id)) db.whitelist.push(id);
-  }
-
+  if (!user.is_whitelisted) { user.is_whitelisted = true; if (!db.whitelist.includes(id)) db.whitelist.push(id); }
   ctx.reply(`👋 မင်္ဂလာပါ! သင်၏ ကျန်ရှိသော Balance: ${user.balance} MMK`);
 });
 
+// Recharge flow
+const rechargeSessions = {};
 bot.command('recharge', ctx => {
   if (ctx.chat.type !== 'private') return;
-  const id = ctx.from.id;
-  rechargeSessions[id] = { step: 1 };
-  ctx.reply(
-    `ထည့်လိုသည့်ပမာဏအားပို့ပေးပါ။`,
-    Markup.inlineKeyboard([ Markup.button.callback('Cancel ❌', 'recharge_cancel') ])
-  );
+  const id = ctx.from.id; rechargeSessions[id] = { step: 1 };
+  ctx.reply('ထည့်လိုသည့်ပမာဏအားပို့ပေးပါ။\n500,1000,2000,...', Markup.inlineKeyboard([Markup.button.callback('Cancel ❌', 'recharge_cancel')]));
 });
-
 bot.action('recharge_cancel', async ctx => {
   const id = ctx.from.id;
-  if (rechargeSessions[id]) {
-    delete rechargeSessions[id];
-    await ctx.editMessageText('Recharge cancelled ❌');
-  } else await ctx.answerCbQuery('No active recharge.');
+  if (rechargeSessions[id]) { delete rechargeSessions[id]; await ctx.editMessageText('Recharge cancelled ❌'); } 
+  else { await ctx.answerCbQuery('No active recharge.'); }
 });
-
 bot.on('message', async ctx => {
   const id = ctx.from.id;
   if (!rechargeSessions[id]) return;
   const session = rechargeSessions[id];
-
   if (session.step === 1) {
     const text = ctx.message.text;
-    if (!text || !/^\d+$/.test(text)) return ctx.reply('❌ Please send a valid number amount.');
+    if (!text || !/^\d+$/.test(text)) return ctx.reply('❌ Please send a valid number');
     const amount = Number(text);
-    const allowedAmounts = [500, 1000, 2000, 5000, 10000];
-    if (!allowedAmounts.includes(amount)) return ctx.reply('❌ Allowed amounts: 500,1000,2000,5000,10000');
-    session.amount = amount;
-    session.step = 2;
-    return ctx.reply(
-      `Send payment proof for ${amount} MMK`,
-      Markup.inlineKeyboard([ Markup.button.callback('Cancel ❌', 'recharge_cancel') ])
-    );
+    const allowed = [500,1000,2000,5000,10000];
+    if (!allowed.includes(amount)) return ctx.reply('❌ Allowed amounts are 500,1000,2000,5000,10000 only.');
+    session.amount = amount; session.step = 2;
+    return ctx.reply(`WavePay/Kpay info\nSend payment screenshot`, Markup.inlineKeyboard([Markup.button.callback('Cancel ❌', 'recharge_cancel')]));
   }
-
   if (session.step === 2 && ctx.message.photo) {
-    const amount = session.amount;
-    delete rechargeSessions[id];
-    const adminId = 7573683327;
+    const amount = session.amount; delete rechargeSessions[id];
+    const adminId = OWNER; 
     const caption = `💰 Recharge request from user ${id}\nAmount: ${amount} MMK`;
     const buttons = Markup.inlineKeyboard([
-      Markup.button.callback(`Confirm ✅ ${id} ${amount}`, `recharge_confirm ${id} ${amount}`),
-      Markup.button.callback(`Cancel ❌ ${id}`, `recharge_reject ${id}`)
+      Markup.button.callback(`Confirm ✅ ${id}_${amount}`, `recharge_confirm_${id}_${amount}`),
+      Markup.button.callback(`Failed ❌ ${id}_${amount}`, `recharge_failed_${id}_${amount}`)
     ]);
-    await ctx.telegram.sendPhoto(adminId, ctx.message.photo[0].file_id, { caption, ...buttons });
-    return ctx.reply('✅ Payment proof sent to admin.');
+    const fileId = ctx.message.photo[ctx.message.photo.length-1].file_id;
+    await ctx.telegram.sendPhoto(adminId, fileId, { caption, ...buttons });
+    return ctx.reply('🔔 Payment proof sent to admin for confirmation.');
   }
 });
 
-// === Recharge Confirm/Reject ===
-bot.action(/recharge_confirm (\d+) (\d+)/, async ctx => {
-  const [_, uidStr, amtStr] = ctx.match;
-  const uid = Number(uidStr);
-  const amt = Number(amtStr);
-  db.users[uid] = db.users[uid] || { balance: 0, is_whitelisted: true };
-  db.users[uid].balance += amt;
-  await ctx.editMessageText(`✅ Recharge confirmed for user ${uid}, +${amt} MMK`);
-  try { await ctx.telegram.sendMessage(uid, `💰 Recharge successful: +${amt} MMK`); } catch {}
+// Confirm/Fail actions
+bot.action(/recharge_confirm_(\d+)_(\d+)/, async ctx => {
+  if (!isAdmin(ctx.from.id) && !isOwner(ctx.from.id)) return ctx.answerCbQuery('❌ Permission denied.');
+  const [_, uidStr, amtStr] = ctx.match; const userId = Number(uidStr), amount = Number(amtStr);
+  db.users[userId] = db.users[userId] || { balance: 0, is_whitelisted: true };
+  db.users[userId].balance += amount;
+  try { await ctx.telegram.sendMessage(userId, `✅ Recharge successful! +${amount} MMK`);
+        await ctx.editMessageCaption(`✅ Recharge confirmed for user ${userId} amount ${amount} MMK.`); } catch {}
+  await ctx.answerCbQuery('Recharge confirmed.');
+});
+bot.action(/recharge_failed_(\d+)_(\d+)/, async ctx => {
+  if (!isAdmin(ctx.from.id) && !isOwner(ctx.from.id)) return ctx.answerCbQuery('❌ Permission denied.');
+  const [_, uidStr, amtStr] = ctx.match; const userId = Number(uidStr), amount = Number(amtStr);
+  try { await ctx.telegram.sendMessage(userId, `❌ Recharge failed.`); await ctx.editMessageCaption(`❌ Recharge failed for user ${userId} amount ${amount} MMK.`); } catch {}
+  await ctx.answerCbQuery('Recharge failed marked.');
 });
 
-bot.action(/recharge_reject (\d+)/, async ctx => {
-  const uid = Number(ctx.match[1]);
-  await ctx.editMessageText(`❌ Recharge rejected for user ${uid}`);
-  try { await ctx.telegram.sendMessage(uid, `❌ Your recharge was rejected`); } catch {}
-});
-
-// === LAUNCH BOT ===
+// === EXPRESS SERVER ===
 bot.launch();
-console.log('✅ Bot is running...');
-
-// === EXPRESS (optional webhook) ===
+console.log('🤖 Bot started');
 const app = express();
+app.get('/', (req, res) => res.send('✅ CharlvynX Telegram Bot is alive!'));
 const PORT = process.env.PORT || 3000;
-app.get('/', (req, res) => res.send('Bot is running!'));
 app.listen(PORT, () => console.log(`🌐 Express server running on port ${PORT}`));
+process.once("SIGINT", () => bot.stop("SIGINT"));
+process.once("SIGTERM", () => bot.stop("SIGTERM"));
