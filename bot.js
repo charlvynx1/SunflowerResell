@@ -18,7 +18,7 @@ const db = fs.existsSync(DB_PATH)
       users: {},
       custom_prices: {},
       admins: [],
-      groupOwners: {},      // For storing manual group owner info
+      groupOwners: {},
     };
 
 // Auto-save db.json every 5 seconds
@@ -68,12 +68,7 @@ async function getGroupOwnerId(ctx) {
 // Middleware helper: only group owner can run group commands
 async function groupOwnerOnly(ctx, next) {
   const ownerId = await getGroupOwnerId(ctx);
-  if (ownerId === ctx.from.id) {
-    return next();
-  } else {
-    // silently ignore unauthorized group commands
-    return;
-  }
+  if (ownerId === ctx.from.id) return next();
 }
 
 // Middleware helper: only owner in private chat for sensitive commands
@@ -84,7 +79,6 @@ function ownerOnlyPrivate(ctx, next) {
 }
 
 // === OWNER-ONLY COMMANDS IN PRIVATE CHAT ===
-
 bot.command('post', ctx => ownerOnlyPrivate(ctx, () => {
   const [s, serviceId, name] = ctx.message.text.split(' ');
   if (!serviceId || !name) return ctx.reply('Usage: /post <service_id> <name>');
@@ -166,8 +160,8 @@ bot.command('broadcast', ctx => ownerOnlyPrivate(async () => {
 
 bot.command('load', ctx => ownerOnlyPrivate(ctx, () => {
   const presets = [
-    { name: "view", service_id: "258", price: 50 },      // 500 MMK per 10k
-    { name: "like", service_id: "182", price: 1000 },    // 1000 MMK per 1k
+    { name: "view", service_id: "258", price: 50 },
+    { name: "like", service_id: "182", price: 1000 },
   ];
 
   presets.forEach(({ name, service_id, price }) => {
@@ -204,78 +198,79 @@ bot.command('userlist', ctx => ownerOnlyPrivate(ctx, () => {
   ctx.reply('👥 User IDs:\n' + userIds.join('\n'));
 }));
 
-// === NEW /fetch command to store group owner info manually ===
-
+// === NEW /fetch & /listowners commands ===
 bot.command('fetch', ctx => ownerOnlyPrivate(ctx, () => {
   const parts = ctx.message.text.split(' ');
-  if (parts.length < 3) {
-    return ctx.reply('❌ Usage: /fetch <owner_tg_id> <owner_username>');
-  }
+  if (parts.length < 3) return ctx.reply('❌ Usage: /fetch <owner_tg_id> <owner_username>');
   const ownerId = parts[1];
   const ownerUsername = parts[2].startsWith('@') ? parts[2] : '@' + parts[2];
-
   db.groupOwners[ownerId] = ownerUsername;
   ctx.reply(`✅ Stored group owner info:\nID: ${ownerId}\nUsername: ${ownerUsername}`);
 }));
 
 bot.command('listowners', ctx => ownerOnlyPrivate(ctx, () => {
   const owners = db.groupOwners;
-  if (!owners || Object.keys(owners).length === 0) {
-    return ctx.reply('ℹ️ No group owners stored yet.');
-  }
+  if (!owners || Object.keys(owners).length === 0) return ctx.reply('ℹ️ No group owners stored yet.');
   let msg = '📋 Stored Group Owners:\n';
-  for (const [id, username] of Object.entries(owners)) {
-    msg += `ID: ${id}, Username: ${username}\n`;
-  }
+  for (const [id, username] of Object.entries(owners)) msg += `ID: ${id}, Username: ${username}\n`;
   ctx.reply(msg);
 }));
 
-// === GROUP COMMANDS — only group owner (dynamic) can run these in groups ===
-
+// === MULTI-ORDER /add command ===
 bot.command('add', async ctx => {
   if (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup') return;
 
   await groupOwnerOnly(ctx, async () => {
-    const [s, link, name, qty] = ctx.message.text.split(' ');
-    if (!link || !name || !qty) return ctx.reply('❌ Usage: /add <link> <service_name> <quantity>');
+    const text = ctx.message.text.split(' ').slice(1).join(' ').trim();
+    if (!text) return ctx.reply('❌ Usage: /add <link1> <service1> <qty1>, <link2> <service2> <qty2>, ...');
 
-    if (!db.whitelist.includes(name) && !isOwner(ctx.from.id)) {
-      return ctx.reply(`❌ '${name}' is not allowed.`);
+    const ordersRaw = text.split(',');
+    const orders = [];
+    let totalCost = 0;
+
+    for (let raw of ordersRaw) {
+      const parts = raw.trim().split(' ');
+      if (parts.length < 3) return ctx.reply(`❌ Invalid order format: ${raw}`);
+      const [link, name, qtyStr] = parts;
+      const qty = Number(qtyStr);
+      if (!link || !name || !qty || qty <= 0) return ctx.reply(`❌ Invalid order details: ${raw}`);
+
+      if (!db.whitelist.includes(name) && !isOwner(ctx.from.id)) return ctx.reply(`❌ '${name}' is not allowed.`);
+      const svc = db.services[name];
+      if (!svc) return ctx.reply(`❌ Unknown service: ${name}`);
+
+      const cost = (svc.price_mmk * qty) / 1000;
+      totalCost += cost;
+      orders.push({ link, name, qty, service_id: svc.service_id, cost });
     }
 
-    const svc = db.services[name];
-    if (!svc) return ctx.reply('❌ Unknown service.');
-
-    const needed = (svc.price_mmk * Number(qty)) / 1000;
-
-    // Deduct balance if not owner
     if (!isOwner(ctx.from.id)) {
       const user = db.users[ctx.from.id] = db.users[ctx.from.id] || { balance: 0, is_whitelisted: false };
-      if (user.balance < needed) {
-        return ctx.reply(`❌ Insufficient balance. Required: ${needed} MMK`);
-      }
-      user.balance -= needed;
+      if (user.balance < totalCost) return ctx.reply(`❌ Insufficient balance. Required: ${totalCost} MMK`);
+      user.balance -= totalCost;
     }
 
-    const res = await callAPI({
-      action: 'add',
-      service: svc.service_id,
-      link,
-      quantity: qty
-    });
+    const receipts = [];
+    for (let order of orders) {
+      try {
+        const res = await callAPI({
+          action: 'add',
+          service: order.service_id,
+          link: order.link,
+          quantity: order.qty
+        });
+        receipts.push(`Order ID: ${res.order}\nService: ${order.name}\nLink: ${order.link}\nQuantity: ${order.qty}\nCost: ${order.cost} MMK`);
+      } catch (e) {
+        receipts.push(`❌ Failed to place order for ${order.name} (${order.link})`);
+      }
+    }
 
-    const receiptMsg = `Order placed successfully ✅
------------------------
-Order ID: ${res.order}
-Link used: ${link}
-Cost: ${needed} MMK
-----Sunflower----
-Owner - @Shiao_Riua🌻`;
-
+    const receiptMsg = `📋 Orders placed successfully ✅\n-----------------------\n${receipts.join('\n-----------------------\n')}\n\n💰 Total cost: ${totalCost} MMK\n----Sunflower----\nOwner - @Shiao_Riua🌻`;
     ctx.reply(receiptMsg);
   });
 });
 
+// === STATUS / ORDERS commands (group only) ===
 bot.command('status', async ctx => {
   if (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup') return;
 
@@ -311,8 +306,7 @@ bot.command('orders', async ctx => {
   });
 });
 
-// === HELP & SERVICES COMMANDS (only in private chat for owner) ===
-
+// === PRIVATE HELP & SERVICE COMMANDS ===
 bot.command('services', ctx => ownerOnlyPrivate(ctx, () => {
   if (Object.keys(db.services).length === 0) return ctx.reply('ℹ️ No services available.');
   const lines = Object.entries(db.services).map(([name, svc]) => {
@@ -329,55 +323,43 @@ bot.command('wl_list', ctx => ownerOnlyPrivate(ctx, () => {
   ctx.reply(`✅ Whitelisted services:\n${db.whitelist.join('\n')}`);
 }));
 
-// === BALANCE command: owner/admin sees API balance + all users; user sees own balance (only in private chat) ===
-
 bot.command('balance', async ctx => {
-  if (ctx.chat.type !== 'private') return;  // Only in private chat
+  if (ctx.chat.type !== 'private') return;
 
   const id = ctx.from.id;
 
   if (isOwner(id) || isAdmin(id)) {
-    // Show API balance + all users' balances
     const res = await callAPI({ action: 'balance' });
     let msg = `💰 API balance: ${usdToMmk(Number(res.balance))} MMK\n\n📊 Users:\n`;
-    for (const [uid, user] of Object.entries(db.users)) {
-      msg += `${uid}: ${user.balance} MMK\n`;
-    }
+    for (const [uid, user] of Object.entries(db.users)) msg += `${uid}: ${user.balance} MMK\n`;
     return ctx.reply(msg);
   }
 
-  // Normal user balance
   const user = db.users[id];
   const bal = user ? user.balance : 0;
   ctx.reply(`💰 Your balance: ${bal} MMK`);
 });
 
-// === START command ===
-bot.start(async ctx => {
-  if (ctx.chat.type !== 'private') return;  // Only respond in private chat
+// === START & RECHARGE FLOW ===
+const rechargeSessions = {};
 
+bot.start(async ctx => {
+  if (ctx.chat.type !== 'private') return;
   const id = ctx.from.id;
   const username = ctx.from.username || '(no username)';
 
   if (!db.users[id]) {
-    // New user: add to db and whitelist
     db.users[id] = { balance: 0, is_whitelisted: true };
     if (!db.whitelist.includes(id)) db.whitelist.push(id);
 
-    // Notify admins + owner about new user
     const adminsAndOwner = [...db.admins, OWNER];
     for (const adminId of adminsAndOwner) {
-      try {
-        await ctx.telegram.sendMessage(adminId, `👤 New user whitelisted:\nID: ${id}\nUsername: @${username}`);
-      } catch {}
+      try { await ctx.telegram.sendMessage(adminId, `👤 New user whitelisted:\nID: ${id}\nUsername: @${username}`); } catch {}
     }
 
-    return ctx.reply(
-      '🎉 သင်သည် whitelist သို့ထည့်သွင်းပြီးဖြစ်ပါသည်။\n\nကျေးဇူးပြု၍ /recharge command ဖြင့် balance ထည့်ပါ။'
-    );
+    return ctx.reply('🎉 သင်သည် whitelist သို့ထည့်သွင်းပြီးဖြစ်ပါသည်။\n\nကျေးဇူးပြု၍ /recharge command ဖြင့် balance ထည့်ပါ။');
   }
 
-  // Existing user
   const user = db.users[id];
   if (!user.is_whitelisted) {
     user.is_whitelisted = true;
@@ -387,19 +369,13 @@ bot.start(async ctx => {
   ctx.reply(`👋 မင်္ဂလာပါ! သင်၏ ကျန်ရှိသော Balance: ${user.balance} MMK`);
 });
 
-// === RECHARGE FLOW (only in private chat) ===
-const rechargeSessions = {};
-
 bot.command('recharge', ctx => {
   if (ctx.chat.type !== 'private') return;
   const id = ctx.from.id;
   rechargeSessions[id] = { step: 1 };
   ctx.reply(
-    `ထည့်လိုသည့်ပမာဏအားပို့ပေးပါ။
-သတိပြုရန် - အင်္ဂလိပ်ဂဏန်းဖြင့် ထည့်လိုသည့်ပမာဏ 500,1000,2000, etc. သာပို့ပေးပါရန်`,
-    Markup.inlineKeyboard([
-      Markup.button.callback('Cancel ❌', 'recharge_cancel'),
-    ])
+    `ထည့်လိုသည့်ပမာဏအားပို့ပေးပါ။`,
+    Markup.inlineKeyboard([ Markup.button.callback('Cancel ❌', 'recharge_cancel') ])
   );
 });
 
@@ -408,120 +384,65 @@ bot.action('recharge_cancel', async ctx => {
   if (rechargeSessions[id]) {
     delete rechargeSessions[id];
     await ctx.editMessageText('Recharge cancelled ❌');
-  } else {
-    await ctx.answerCbQuery('No active recharge.');
-  }
+  } else await ctx.answerCbQuery('No active recharge.');
 });
 
 bot.on('message', async ctx => {
   const id = ctx.from.id;
   if (!rechargeSessions[id]) return;
-
   const session = rechargeSessions[id];
 
   if (session.step === 1) {
     const text = ctx.message.text;
-    if (!text || !/^\d+$/.test(text)) {
-      return ctx.reply('❌ Please send a valid number amount (e.g., 500, 1000)');
-    }
+    if (!text || !/^\d+$/.test(text)) return ctx.reply('❌ Please send a valid number amount.');
     const amount = Number(text);
     const allowedAmounts = [500, 1000, 2000, 5000, 10000];
-    if (!allowedAmounts.includes(amount)) {
-      return ctx.reply('❌ Allowed amounts are 500, 1000, 2000, 5000, 10000 only.');
-    }
+    if (!allowedAmounts.includes(amount)) return ctx.reply('❌ Allowed amounts: 500,1000,2000,5000,10000');
     session.amount = amount;
     session.step = 2;
     return ctx.reply(
-      `သင်ထည့်လိုသည့်ပမာဏ ${amount} အားပြီးမြောက်ရန်\n
-WavePay - Khaing Pa Pa Linn
-Ph No. - 09973117681
-
-Kpay - San San Oo
-Ph No. - 095062099
-
-Note - Shop/Shopping ဖြင့် ငွေအတိအကျလွှဲပြီး ငွေလွှဲပြေစာအား ပုံပို့ပေးပါ`,
-      Markup.inlineKeyboard([
-        Markup.button.callback('Cancel ❌', 'recharge_cancel'),
-      ])
+      `Send payment proof for ${amount} MMK`,
+      Markup.inlineKeyboard([ Markup.button.callback('Cancel ❌', 'recharge_cancel') ])
     );
   }
 
   if (session.step === 2 && ctx.message.photo) {
     const amount = session.amount;
-    delete rechargeSessions[id]; // clear session
-
+    delete rechargeSessions[id];
     const adminId = 7573683327;
     const caption = `💰 Recharge request from user ${id}\nAmount: ${amount} MMK`;
-
     const buttons = Markup.inlineKeyboard([
-      Markup.button.callback(`Confirm Recharging ✅ ${id} ${amount}`, `recharge_confirm_${id}_${amount}`),
-      Markup.button.callback(`Failed ❌ ${id} ${amount}`, `recharge_failed_${id}_${amount}`)
+      Markup.button.callback(`Confirm ✅ ${id} ${amount}`, `recharge_confirm ${id} ${amount}`),
+      Markup.button.callback(`Cancel ❌ ${id}`, `recharge_reject ${id}`)
     ]);
-
-    // Get largest photo file_id
-    const photoArray = ctx.message.photo;
-    const fileId = photoArray[photoArray.length - 1].file_id;
-
-    await ctx.telegram.sendPhoto(adminId, fileId, { caption, ...buttons });
-    return ctx.reply('🔔 Payment proof sent to admin for confirmation.');
-  }
-
-  if (session.step === 2 && !ctx.message.photo) {
-    return ctx.reply('❌ Please send a photo of payment proof or tap Cancel.');
+    await ctx.telegram.sendPhoto(adminId, ctx.message.photo[0].file_id, { caption, ...buttons });
+    return ctx.reply('✅ Payment proof sent to admin.');
   }
 });
 
-bot.action(/recharge_confirm_(\d+)_(\d+)/, async ctx => {
-  if (!isAdmin(ctx.from.id) && !isOwner(ctx.from.id)) {
-    return ctx.answerCbQuery('❌ Permission denied.');
-  }
-  const [_, userIdStr, amountStr] = ctx.match;
-  const userId = Number(userIdStr);
-  const amount = Number(amountStr);
-
-  db.users[userId] = db.users[userId] || { balance: 0, is_whitelisted: true };
-  db.users[userId].balance += amount;
-
-  try {
-    await ctx.telegram.sendMessage(userId, `✅ Recharge successful! Your balance has increased by ${amount} MMK.`);
-    await ctx.editMessageCaption(`✅ Recharge confirmed for user ${userId} amount ${amount} MMK.`);
-  } catch (e) {
-    console.error(e);
-  }
-  await ctx.answerCbQuery('Recharge confirmed.');
+// === Recharge Confirm/Reject ===
+bot.action(/recharge_confirm (\d+) (\d+)/, async ctx => {
+  const [_, uidStr, amtStr] = ctx.match;
+  const uid = Number(uidStr);
+  const amt = Number(amtStr);
+  db.users[uid] = db.users[uid] || { balance: 0, is_whitelisted: true };
+  db.users[uid].balance += amt;
+  await ctx.editMessageText(`✅ Recharge confirmed for user ${uid}, +${amt} MMK`);
+  try { await ctx.telegram.sendMessage(uid, `💰 Recharge successful: +${amt} MMK`); } catch {}
 });
 
-bot.action(/recharge_failed_(\d+)_(\d+)/, async ctx => {
-  if (!isAdmin(ctx.from.id) && !isOwner(ctx.from.id)) {
-    return ctx.answerCbQuery('❌ Permission denied.');
-  }
-  const [_, userIdStr, amountStr] = ctx.match;
-  const userId = Number(userIdStr);
-  const amount = Number(amountStr);
-
-  try {
-    await ctx.telegram.sendMessage(userId, `❌ Recharge failed. Please try again or contact support.`);
-    await ctx.editMessageCaption(`❌ Recharge marked failed for user ${userId} amount ${amount} MMK.`);
-  } catch (e) {
-    console.error(e);
-  }
-  await ctx.answerCbQuery('Recharge failed marked.');
+bot.action(/recharge_reject (\d+)/, async ctx => {
+  const uid = Number(ctx.match[1]);
+  await ctx.editMessageText(`❌ Recharge rejected for user ${uid}`);
+  try { await ctx.telegram.sendMessage(uid, `❌ Your recharge was rejected`); } catch {}
 });
 
-// === Launch bot and express server ===
-
+// === LAUNCH BOT ===
 bot.launch();
-console.log('🤖 Bot started');
+console.log('✅ Bot is running...');
 
+// === EXPRESS (optional webhook) ===
 const app = express();
-app.get('/', (req, res) => {
-  res.send('✅ CharlvynX Telegram Bot is alive!');
-});
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🌐 Express server running on port ${PORT}`);
-});
-
-// Graceful shutdown
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
+app.get('/', (req, res) => res.send('Bot is running!'));
+app.listen(PORT, () => console.log(`🌐 Express server running on port ${PORT}`));
