@@ -1,352 +1,516 @@
+// bot.js
+// Telegram bot for ShweBoost API v2 – owner-only ordering with local JSON DB
+// Requires: node 18+, npm i telegraf axios qs express
+
 require('dotenv').config();
-const { Telegraf, Markup } = require('telegraf');
-const fetch = require('node-fetch');
-const fs = require('fs-extra');
+const { Telegraf } = require('telegraf');
+const axios = require('axios');
+const qs = require('qs');
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
-const OWNER = Number(process.env.OWNER_ID);
-let USD_TO_MMK = Number(process.env.USD_TO_MMK || 2100);
+// ==== ENV ====
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const OWNER_ID = String(process.env.OWNER_ID || '').trim(); // single owner ID
+const SHWEBOOST_API_KEY = process.env.SHWEBOOST_API_KEY;
+const TIMEZONE = process.env.TIMEZONE || 'Asia/Yangon';
 
-// === DATABASE ===
-const DB_PATH = './db.json';
-const db = fs.existsSync(DB_PATH)
-  ? fs.readJSONSync(DB_PATH)
-  : {
-      services: {},
-      whitelist: [],
-      users: {},
-      custom_prices: {},
-      admins: [],
-      groupOwners: {},
-    };
-
-// Auto-save db.json every 5 seconds
-setInterval(() => {
-  fs.writeJSONSync(DB_PATH, db, { spaces: 2 });
-}, 5000);
-
-// === HELPERS ===
-function isOwner(id) { return id === OWNER; }
-function isAdmin(id) { return db.admins.includes(id); }
-function hasAccess(id) { return isOwner(id) || isAdmin(id) || (db.users[id] && db.users[id].is_whitelisted); }
-function usdToMmk(usd) { return usd * USD_TO_MMK; }
-
-async function callAPI(params) {
-  const res = await fetch('https://shweboost.com/api/v2', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ key: process.env.SHWEBOOST_KEY, ...params }),
-  });
-  return await res.json();
+// Validate env
+if (!BOT_TOKEN || !OWNER_ID || !SHWEBOOST_API_KEY) {
+  console.error('❌ Missing env. Required: BOT_TOKEN, OWNER_ID, SHWEBOOST_API_KEY');
+  process.exit(1);
 }
 
-async function getGroupOwnerId(ctx) {
-  if (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup') return null;
+// ==== CONSTANTS ====
+const API_URL = 'https://shweboost.com/api/v2';
+const USD_TO_MMK = 2098; // fixed rate as requested
+const DB_FILE = path.join(__dirname, 'db.json');
+
+// ==== SIMPLE JSON DB ====
+function defaultDB() {
+  return {
+    products: {
+      // nameLower: { id: "serviceIdString", price_mmk_per_1k: number }
+      // example: "instagram followers": { id: "101", price_mmk_per_1k: 2500 }
+    },
+    users: {
+      // allowed users record-keeping (from /fetch); currently not used for auth
+      // "123456789": "@username"
+    },
+    orders: [
+      // { id: "12345", name: "Instagram Followers", qty: 1000, cost_mmk: 2098, link: "https://...", ts: 1712345678901 }
+    ],
+  };
+}
+
+function loadDB() {
   try {
-    const admins = await ctx.telegram.getChatAdministrators(ctx.chat.id);
-    const owner = admins.find(adm => adm.status === 'creator');
-    return owner ? owner.user.id : null;
-  } catch (e) { console.error(e); return null; }
+    if (!fs.existsSync(DB_FILE)) {
+      fs.writeFileSync(DB_FILE, JSON.stringify(defaultDB(), null, 2));
+    }
+    const raw = fs.readFileSync(DB_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    // Ensure required keys
+    return { ...defaultDB(), ...data };
+  } catch (e) {
+    console.error('DB load error:', e);
+    return defaultDB();
+  }
 }
 
-async function groupOwnerOnly(ctx, next) {
-  const ownerId = await getGroupOwnerId(ctx);
-  if (ownerId === ctx.from.id) return next();
+let DB = loadDB();
+let saveTimeout = null;
+function saveDB() {
+  try {
+    if (saveTimeout) clearTimeout(saveTimeout);
+    saveTimeout = setTimeout(() => {
+      fs.writeFileSync(DB_FILE, JSON.stringify(DB, null, 2));
+    }, 150);
+  } catch (e) {
+    console.error('DB save error:', e);
+  }
 }
-function ownerOnlyPrivate(ctx, next) {
-  if (ctx.chat.type !== 'private') return;
-  if (!isOwner(ctx.from.id)) return;
-  return next();
-}
 
-// === OWNER/ADMIN COMMANDS ===
-bot.command('post', ctx => ownerOnlyPrivate(ctx, () => {
-  const [s, serviceId, name] = ctx.message.text.split(' ');
-  if (!serviceId || !name) return ctx.reply('Usage: /post <service_id> <name>');
-  db.services[name] = { service_id: serviceId, price_mmk: 0 };
-  ctx.reply(`✅ Service '${name}' posted.`);
-}));
-
-bot.command('setprice', ctx => ownerOnlyPrivate(ctx, () => {
-  const [s, name, price] = ctx.message.text.split(' ');
-  if (!name || !price) return ctx.reply('Usage: /setprice <name> <price>');
-  if (!db.services[name]) return ctx.reply('❌ Unknown service.');
-  db.services[name].price_mmk = Number(price);
-  ctx.reply(`✅ '${name}' price set to ${price} MMK/1k`);
-}));
-
-bot.command('wl', ctx => ownerOnlyPrivate(ctx, () => {
-  const [s, name] = ctx.message.text.split(' ');
-  if (!name) return ctx.reply('Usage: /wl <service_name>');
-  if (!db.services[name]) return ctx.reply('❌ Unknown service.');
-  if (!db.whitelist.includes(name)) db.whitelist.push(name);
-  ctx.reply(`✅ '${name}' whitelisted.`);
-}));
-
-bot.command('unwl', ctx => ownerOnlyPrivate(ctx, () => {
-  const [s, name] = ctx.message.text.split(' ');
-  if (!name) return ctx.reply('Usage: /unwl <service_name>');
-  db.whitelist = db.whitelist.filter(n => n !== name);
-  ctx.reply(`✅ '${name}' removed from whitelist.`);
-}));
-
-bot.command('adduser', ctx => ownerOnlyPrivate(ctx, () => {
-  const [s, id] = ctx.message.text.split(' ');
-  if (!id) return ctx.reply('Usage: /adduser <tg_id>');
-  const uid = Number(id);
-  db.users[uid] = db.users[uid] || { balance: 0, is_whitelisted: true };
-  db.users[uid].is_whitelisted = true;
-  ctx.reply(`✅ User ${id} whitelisted.`);
-}));
-
-bot.command('addbalance', ctx => ownerOnlyPrivate(ctx, () => {
-  const [s, id, amt] = ctx.message.text.split(' ');
-  if (!id || !amt) return ctx.reply('Usage: /addbalance <tg_id> <amount>');
-  const uid = Number(id), a = Number(amt);
-  db.users[uid] = db.users[uid] || { balance: 0, is_whitelisted: false };
-  db.users[uid].balance += a;
-  ctx.reply(`✅ Added ${a} MMK to user ${id}.`);
-}));
-
-bot.command('setrate', ctx => ownerOnlyPrivate(ctx, () => {
-  const [s, rate] = ctx.message.text.split(' ');
-  if (!rate) return ctx.reply('Usage: /setrate <rate>');
-  USD_TO_MMK = Number(rate);
-  ctx.reply(`✅ Exchange rate set to ${USD_TO_MMK} MMK/USD`);
-}));
-
-bot.command('send', ctx => ownerOnlyPrivate(ctx, () => {
-  const [s, id, ...rest] = ctx.message.text.split(' ');
-  if (!id || rest.length === 0) return ctx.reply('Usage: /send <tg_id> <message>');
-  const msg = rest.join(' ');
-  ctx.telegram.sendMessage(Number(id), msg);
-  ctx.reply('✅ Message sent.');
-}));
-
-bot.command('broadcast', ctx => ownerOnlyPrivate(async () => {
-  const text = ctx.message.text.replace('/broadcast', '').trim();
-  if (!text) return ctx.reply('❌ Usage: /broadcast <message>');
-  let count = 0;
-  for (const [uid, user] of Object.entries(db.users)) {
-    if (user.is_whitelisted) {
-      try { await bot.telegram.sendMessage(Number(uid), `📢 ${text}`); count++; } catch {}
-    }
-  }
-  ctx.reply(`✅ Broadcast sent to ${count} users.`);
-}));
-
-bot.command('load', ctx => ownerOnlyPrivate(ctx, () => {
-  const presets = [
-    { name: "view", service_id: "258", price: 50 },
-    { name: "like", service_id: "182", price: 1000 },
-  ];
-  presets.forEach(({ name, service_id, price }) => {
-    db.services[name] = { service_id, price_mmk: price };
-    if (!db.whitelist.includes(name)) db.whitelist.push(name);
-  });
-  ctx.reply("✅ Preset services loaded:\n- view (500 MMK/10k)\n- like (1000 MMK/1k)");
-}));
-
-bot.command('promote', ctx => ownerOnlyPrivate(ctx, () => {
-  const [cmd, idStr] = ctx.message.text.split(' ');
-  const id = Number(idStr);
-  if (!id) return ctx.reply('❌ Invalid TG ID.');
-  if (!db.admins.includes(id)) db.admins.push(id);
-  ctx.reply(`✅ User ${id} promoted to admin.`);
-}));
-
-bot.command('demote', ctx => ownerOnlyPrivate(ctx, () => {
-  const [cmd, idStr] = ctx.message.text.split(' ');
-  const id = Number(idStr);
-  db.admins = db.admins.filter(adminId => adminId !== id);
-  ctx.reply(`✅ User ${id} demoted from admin.`);
-}));
-
-bot.command('userlist', ctx => ownerOnlyPrivate(ctx, () => {
-  const userIds = Object.keys(db.users);
-  if (!userIds.length) return ctx.reply('ℹ️ No users found.');
-  ctx.reply('👥 User IDs:\n' + userIds.join('\n'));
-}));
-
-bot.command('fetch', ctx => ownerOnlyPrivate(ctx, () => {
-  const parts = ctx.message.text.split(' ');
-  if (parts.length < 3) return ctx.reply('❌ Usage: /fetch <owner_tg_id> <owner_username>');
-  const ownerId = parts[1], ownerUsername = parts[2].startsWith('@') ? parts[2] : '@' + parts[2];
-  db.groupOwners[ownerId] = ownerUsername;
-  ctx.reply(`✅ Stored group owner info:\nID: ${ownerId}\nUsername: ${ownerUsername}`);
-}));
-
-bot.command('listowners', ctx => ownerOnlyPrivate(ctx, () => {
-  const owners = db.groupOwners;
-  if (!owners || !Object.keys(owners).length) return ctx.reply('ℹ️ No group owners stored yet.');
-  let msg = '📋 Stored Group Owners:\n';
-  for (const [id, username] of Object.entries(owners)) msg += `ID: ${id}, Username: ${username}\n`;
-  ctx.reply(msg);
-}));
-
-// === GROUP COMMANDS ===
-bot.command('add', async ctx => {
-  if (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup') return;
-
-  await groupOwnerOnly(ctx, async () => {
-    const parts = ctx.message.text.split(' ').slice(1); // remove '/add'
-    if (!parts.length) return ctx.reply('❌ Usage: /add <link> <product_name> <qty> / <product_name> <qty> ...');
-
-    const orders = [];
-    let link = parts.shift();
-    while (parts.length) {
-      const [nameQty, ...rest] = parts;
-      const [name, qty] = nameQty.split('/');
-      const qtyNum = Number(qty || rest.shift());
-      if (!name || !qtyNum) break;
-      orders.push({ name, qty: qtyNum });
-    }
-
-    let receipt = `🛒 Order Summary:\n----------------\n`;
-    let totalCost = 0;
-
-    for (const { name, qty } of orders) {
-      if (!db.services[name]) {
-        receipt += `❌ Unknown service '${name}'\n`;
-        continue;
-      }
-      if (!db.whitelist.includes(name) && !isOwner(ctx.from.id)) {
-        receipt += `❌ '${name}' not allowed\n`;
-        continue;
-      }
-
-      const svc = db.services[name];
-      const cost = (svc.price_mmk * qty) / 1000;
-      totalCost += cost;
-
-      // Deduct balance if not owner
-      if (!isOwner(ctx.from.id)) {
-        const user = db.users[ctx.from.id] = db.users[ctx.from.id] || { balance: 0, is_whitelisted: false };
-        if (user.balance < cost) {
-          receipt += `❌ Insufficient balance for '${name}'\n`;
-          continue;
-        }
-        user.balance -= cost;
-      }
-
-      const res = await callAPI({ action: 'add', service: svc.service_id, link, quantity: qty });
-      receipt += `✅ ${name} x${qty} — ${cost} MMK — Order ID: ${res.order}\n`;
-    }
-    receipt += `----------------\nTotal Cost: ${totalCost} MMK`;
-    ctx.reply(receipt);
-  });
-});
-
-// Status & orders commands
-bot.command('status', async ctx => {
-  if (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup') return;
-  await groupOwnerOnly(ctx, async () => {
-    const id = ctx.message.text.split(' ')[1];
-    if (!id) return ctx.reply('❌ Usage: /status <order_id>');
-    const res = await callAPI({ action: 'status', order: id });
-    const mmk = usdToMmk(Number(res.charge));
-    ctx.reply(`📦 ID ${id} — Status: ${res.status}, Charge: ${mmk} MMK`);
-  });
-});
-
-bot.command('orders', async ctx => {
-  if (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup') return;
-  await groupOwnerOnly(ctx, async () => {
-    const idsText = ctx.message.text.split(' ')[1];
-    if (!idsText) return ctx.reply('❌ Usage: /orders <id1,id2,...>');
-    const ids = idsText.split(',');
-    const parts = [];
-    for (let id of ids) {
-      try {
-        const res = await callAPI({ action: 'status', order: id });
-        const mmk = usdToMmk(Number(res.charge));
-        parts.push(`ID ${id}: ${res.status}, ${mmk} MMK`);
-      } catch { parts.push(`ID ${id}: Error fetching status`); }
-    }
-    ctx.reply(parts.join('\n'));
-  });
-});
-
-// === USER COMMANDS ===
-bot.start(async ctx => {
-  if (ctx.chat.type !== 'private') return;
-  const id = ctx.from.id, username = ctx.from.username || '(no username)';
-  if (!db.users[id]) {
-    db.users[id] = { balance: 0, is_whitelisted: true };
-    if (!db.whitelist.includes(id)) db.whitelist.push(id);
-    [...db.admins, OWNER].forEach(async adminId => {
-      try { await ctx.telegram.sendMessage(adminId, `👤 New user whitelisted:\nID: ${id}\nUsername: @${username}`); } catch {}
-    });
-    return ctx.reply('🎉 သင်သည် whitelist သို့ထည့်သွင်းပြီးဖြစ်ပါသည်။\n\nကျေးဇူးပြု၍ /recharge command ဖြင့် balance ထည့်ပါ။');
-  }
-  const user = db.users[id];
-  if (!user.is_whitelisted) { user.is_whitelisted = true; if (!db.whitelist.includes(id)) db.whitelist.push(id); }
-  ctx.reply(`👋 မင်္ဂလာပါ! သင်၏ ကျန်ရှိသော Balance: ${user.balance} MMK`);
-});
-
-// Recharge flow
-const rechargeSessions = {};
-bot.command('recharge', ctx => {
-  if (ctx.chat.type !== 'private') return;
-  const id = ctx.from.id; rechargeSessions[id] = { step: 1 };
-  ctx.reply('ထည့်လိုသည့်ပမာဏအားပို့ပေးပါ။\n500,1000,2000,...', Markup.inlineKeyboard([Markup.button.callback('Cancel ❌', 'recharge_cancel')]));
-});
-bot.action('recharge_cancel', async ctx => {
-  const id = ctx.from.id;
-  if (rechargeSessions[id]) { delete rechargeSessions[id]; await ctx.editMessageText('Recharge cancelled ❌'); } 
-  else { await ctx.answerCbQuery('No active recharge.'); }
-});
-bot.on('message', async ctx => {
-  const id = ctx.from.id;
-  if (!rechargeSessions[id]) return;
-  const session = rechargeSessions[id];
-  if (session.step === 1) {
-    const text = ctx.message.text;
-    if (!text || !/^\d+$/.test(text)) return ctx.reply('❌ Please send a valid number');
-    const amount = Number(text);
-    const allowed = [500,1000,2000,5000,10000];
-    if (!allowed.includes(amount)) return ctx.reply('❌ Allowed amounts are 500,1000,2000,5000,10000 only.');
-    session.amount = amount; session.step = 2;
-    return ctx.reply(`WavePay/Kpay info\nSend payment screenshot`, Markup.inlineKeyboard([Markup.button.callback('Cancel ❌', 'recharge_cancel')]));
-  }
-  if (session.step === 2 && ctx.message.photo) {
-    const amount = session.amount; delete rechargeSessions[id];
-    const adminId = OWNER; 
-    const caption = `💰 Recharge request from user ${id}\nAmount: ${amount} MMK`;
-    const buttons = Markup.inlineKeyboard([
-      Markup.button.callback(`Confirm ✅ ${id}_${amount}`, `recharge_confirm_${id}_${amount}`),
-      Markup.button.callback(`Failed ❌ ${id}_${amount}`, `recharge_failed_${id}_${amount}`)
-    ]);
-    const fileId = ctx.message.photo[ctx.message.photo.length-1].file_id;
-    await ctx.telegram.sendPhoto(adminId, fileId, { caption, ...buttons });
-    return ctx.reply('🔔 Payment proof sent to admin for confirmation.');
-  }
-});
-
-// Confirm/Fail actions
-bot.action(/recharge_confirm_(\d+)_(\d+)/, async ctx => {
-  if (!isAdmin(ctx.from.id) && !isOwner(ctx.from.id)) return ctx.answerCbQuery('❌ Permission denied.');
-  const [_, uidStr, amtStr] = ctx.match; const userId = Number(uidStr), amount = Number(amtStr);
-  db.users[userId] = db.users[userId] || { balance: 0, is_whitelisted: true };
-  db.users[userId].balance += amount;
-  try { await ctx.telegram.sendMessage(userId, `✅ Recharge successful! +${amount} MMK`);
-        await ctx.editMessageCaption(`✅ Recharge confirmed for user ${userId} amount ${amount} MMK.`); } catch {}
-  await ctx.answerCbQuery('Recharge confirmed.');
-});
-bot.action(/recharge_failed_(\d+)_(\d+)/, async ctx => {
-  if (!isAdmin(ctx.from.id) && !isOwner(ctx.from.id)) return ctx.answerCbQuery('❌ Permission denied.');
-  const [_, uidStr, amtStr] = ctx.match; const userId = Number(uidStr), amount = Number(amtStr);
-  try { await ctx.telegram.sendMessage(userId, `❌ Recharge failed.`); await ctx.editMessageCaption(`❌ Recharge failed for user ${userId} amount ${amount} MMK.`); } catch {}
-  await ctx.answerCbQuery('Recharge failed marked.');
-});
-
-// === EXPRESS SERVER ===
-bot.launch();
-console.log('🤖 Bot started');
+// ==== HELPERS ====
+const bot = new Telegraf(BOT_TOKEN);
 const app = express();
-app.get('/', (req, res) => res.send('✅ CharlvynX Telegram Bot is alive!'));
+
+// Keep-alive (useful on Render)
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🌐 Express server running on port ${PORT}`));
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
+app.get('/', (_req, res) => res.send('ShweBoost Telegram Bot is running'));
+app.listen(PORT, () => console.log(`🌐 Express listening on :${PORT}`));
+
+// Call ShweBoost API (form-encoded)
+async function callAPI(params) {
+  const body = { key: SHWEBOOST_API_KEY, ...params };
+  const { data } = await axios.post(API_URL, qs.stringify(body), {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    timeout: 20000,
+  });
+  return data;
+}
+
+// Owner guard (always enforce in groups; in DMs for owner-only commands)
+function isOwner(ctx) {
+  return ctx.from && String(ctx.from.id) === OWNER_ID;
+}
+
+function isGroup(ctx) {
+  return ctx.chat && ['group', 'supergroup'].includes(ctx.chat.type);
+}
+
+// Format money
+function fmtMMK(n) {
+  try {
+    const rounded = Math.round(n);
+    return `${rounded.toLocaleString('en-US')} MMK`;
+  } catch {
+    return `${Math.round(n)} MMK`;
+  }
+}
+
+// Monospace receipt block
+function codeBlock(text) {
+  return '```\n' + text + '\n```';
+}
+
+// Find product by name (case-insensitive)
+function getProductByName(nameInput) {
+  const key = String(nameInput).trim().toLowerCase();
+  return DB.products[key] ? { name: nameInput, key, ...DB.products[key] } : null;
+}
+
+// Parse /post and /setprice arguments where the last token is numeric/id
+function parseTrailingNumberOrId(argsText) {
+  const parts = argsText.trim().split(/\s+/);
+  if (parts.length < 2) return null;
+  const tail = parts.pop();
+  const head = parts.join(' ');
+  return { head, tail };
+}
+
+// Get last N orders
+function getLastNOrders(n) {
+  const N = Math.max(1, Math.min(100, Number(n) || 1));
+  const list = DB.orders.slice(-N).reverse();
+  return list;
+}
+
+// Compute cost based on stored price per 1k
+function calcCostMMK(pricePer1k, qty) {
+  return (Number(pricePer1k) / 1000) * Number(qty);
+}
+
+// Prepare greedy matcher for multi-item parsing using known product names
+function prepareNameMatcher() {
+  const names = Object.keys(DB.products); // already lowercase
+  // Sort by length desc to match the longest names first
+  return names.sort((a, b) => b.length - a.length);
+}
+
+// Parse /add command:
+// /add <link> <product name> <qty> [<product name> <qty> ...]
+function parseAddCommand(text) {
+  // Remove the command
+  const rest = text.replace(/^\/add(@\w+)?\s+/i, '').trim();
+  if (!rest) return { error: 'Missing arguments. Usage: /add <link> <product name> <qty> ...' };
+
+  // First token is link (until first space)
+  const spaceIdx = rest.indexOf(' ');
+  if (spaceIdx === -1) {
+    return { error: 'Missing product/qty. Usage: /add <link> <product name> <qty> ...' };
+  }
+  const link = rest.slice(0, spaceIdx).trim();
+  const after = rest.slice(spaceIdx + 1).trim();
+
+  if (!/^https?:\/\//i.test(link)) {
+    // still allow non-http links, but warn
+    // but per requirement: no preview anyway
+  }
+
+  // Now we need to parse pairs: <product name> <qty> using known product names
+  const matcher = prepareNameMatcher();
+  if (matcher.length === 0) {
+    return { error: 'No products imported. Use /post and /setprice first.' };
+  }
+
+  let remaining = after.toLowerCase();
+  const originalAfter = after; // keep for slicing names in original casing
+  const items = [];
+  let cursor = 0; // position in originalAfter for slicing original names
+
+  // Strategy: scan remaining text, repeatedly find any known product name at the start,
+  // then the next integer as qty.
+  // But names can appear anywhere; we’ll search for a known name boundary followed by qty.
+  // We do a progressive match from the left.
+  while (remaining.trim().length > 0) {
+    let matchedNameKey = null;
+    let matchedNameStart = -1;
+    let matchedNameEnd = -1;
+
+    // Find the earliest occurrence (lowest index) among all names
+    let earliest = { idx: Infinity, nameKey: null, length: 0 };
+    for (const nk of matcher) {
+      const idx = remaining.indexOf(nk);
+      if (idx !== -1 && idx < earliest.idx) {
+        earliest = { idx, nameKey: nk, length: nk.length };
+      }
+    }
+
+    if (!earliest.nameKey || earliest.idx === Infinity) break;
+
+    matchedNameKey = earliest.nameKey;
+    matchedNameStart = earliest.idx;
+    matchedNameEnd = earliest.idx + earliest.length;
+
+    // Cut off text before the match (irrelevant tokens)
+    const beforeCut = remaining.slice(0, matchedNameStart);
+    const consumedBefore = beforeCut.length;
+    remaining = remaining.slice(matchedNameStart);
+    cursor += consumedBefore;
+
+    // Now matched name is at start of remaining
+    // Move cursor over name
+    const consumedName = matchedNameEnd - matchedNameStart;
+    const nameLower = remaining.slice(0, consumedName);
+    remaining = remaining.slice(consumedName).trim();
+    cursor += consumedName;
+
+    // Extract original-cased name from originalAfter using cursor history
+    // We know the length in lowercase equals length in original
+    const originalName = originalAfter.slice(cursor - consumedName, cursor);
+
+    // Next token must be a quantity integer
+    const qtyMatch = remaining.match(/^(\d+)(\s+|$)/);
+    if (!qtyMatch) {
+      // If no qty follows, stop here
+      break;
+    }
+    const qtyStr = qtyMatch[1];
+    const qty = Number(qtyStr);
+    remaining = remaining.slice(qtyMatch[0].length).trim();
+    cursor += qtyMatch[0].length;
+
+    items.push({ nameKey: matchedNameKey, displayName: originalName.trim(), qty });
+  }
+
+  if (items.length === 0) {
+    return { error: 'Could not parse items. Make sure your product names match imported names and include quantities.' };
+  }
+
+  return { link, items };
+}
+
+// ==== COMMANDS ====
+
+// /start (DM only meaningful, but we’ll allow everywhere)
+bot.start(async (ctx) => {
+  const who = isOwner(ctx) ? 'Owner' : 'User';
+  await ctx.reply(
+    `✅ Bot is active.\nRole: ${who}\nTimezone: ${TIMEZONE}\n\nGroup commands (Owner only):\n/add <link> <product> <qty> [...]\n/orders\n/orderinfo <number>\n\nDM Owner commands:\n/post <product name> <product id>\n/setprice <product name> <mmk per 1000>\n/services\n/fetch <tg id> <@username>\n/balance`,
+    { disable_web_page_preview: true }
+  );
+});
+
+// /services (DM owner) – list imported products & prices
+bot.command('services', async (ctx) => {
+  if (!isOwner(ctx)) return; // owner-only
+  if (isGroup(ctx)) {
+    // Allow owner to run anywhere if you prefer; here we reply but it's fine in group too
+  }
+
+  const names = Object.keys(DB.products);
+  if (names.length === 0) {
+    return ctx.reply('No products imported yet. Use /post and /setprice.', { disable_web_page_preview: true });
+  }
+  const lines = names
+    .sort()
+    .map((k) => {
+      const p = DB.products[k];
+      const title = k.replace(/\b\w/g, (c) => c.toUpperCase());
+      const price = p.price_mmk_per_1k ? `${fmtMMK(p.price_mmk_per_1k)} / 1k` : 'price not set';
+      return `${title} — id:${p.id} — ${price}`;
+    })
+    .join('\n');
+
+  await ctx.reply(codeBlock(lines), { parse_mode: 'MarkdownV2', disable_web_page_preview: true });
+});
+
+// /post <product name> <product id>  (DM owner)
+bot.command('post', async (ctx) => {
+  if (!isOwner(ctx)) return;
+  const text = ctx.message.text || '';
+  const args = text.replace(/^\/post(@\w+)?\s*/i, '');
+  const parsed = parseTrailingNumberOrId(args);
+  if (!parsed) {
+    return ctx.reply('Usage: /post <product name> <product id>', { disable_web_page_preview: true });
+  }
+  const name = parsed.head.trim();
+  const id = parsed.tail.trim();
+  if (!name || !id) {
+    return ctx.reply('Usage: /post <product name> <product id>', { disable_web_page_preview: true });
+  }
+  const key = name.toLowerCase();
+  if (!DB.products[key]) DB.products[key] = { id: '', price_mmk_per_1k: 0 };
+  DB.products[key].id = id;
+  saveDB();
+  return ctx.reply(`✅ Added/updated product:\n${name} → id ${id}`, { disable_web_page_preview: true });
+});
+
+// /setprice <product name> <mmk per 1000>  (DM owner)
+bot.command('setprice', async (ctx) => {
+  if (!isOwner(ctx)) return;
+  const text = ctx.message.text || '';
+  const args = text.replace(/^\/setprice(@\w+)?\s*/i, '');
+  const parsed = parseTrailingNumberOrId(args);
+  if (!parsed) {
+    return ctx.reply('Usage: /setprice <product name> <mmk per 1000>', { disable_web_page_preview: true });
+  }
+  const name = parsed.head.trim();
+  const priceStr = parsed.tail.trim();
+  const price = Number(priceStr);
+  if (!name || !Number.isFinite(price) || price <= 0) {
+    return ctx.reply('Usage: /setprice <product name> <mmk per 1000>', { disable_web_page_preview: true });
+  }
+  const key = name.toLowerCase();
+  if (!DB.products[key]) DB.products[key] = { id: '', price_mmk_per_1k: 0 };
+  DB.products[key].price_mmk_per_1k = price;
+  saveDB();
+  return ctx.reply(`✅ Price set: ${name} → ${fmtMMK(price)} per 1k`, { disable_web_page_preview: true });
+});
+
+// /fetch <tg id> <@username>  (DM owner) – record-keeping
+bot.command('fetch', async (ctx) => {
+  if (!isOwner(ctx)) return;
+  const text = ctx.message.text || '';
+  const args = text.replace(/^\/fetch(@\w+)?\s*/i, '').trim();
+  const m = args.match(/^(\d+)\s+(@?[A-Za-z0-9_]{5,})$/);
+  if (!m) {
+    return ctx.reply('Usage: /fetch <tg id> <@username>', { disable_web_page_preview: true });
+  }
+  const tgId = m[1];
+  const username = m[2].startsWith('@') ? m[2] : '@' + m[2];
+  DB.users[tgId] = username;
+  saveDB();
+  return ctx.reply(`✅ Recorded user: ${tgId} ${username}`, { disable_web_page_preview: true });
+});
+
+// /balance (DM owner) – show API balance (USD) + MMK conversion
+bot.command('balance', async (ctx) => {
+  if (!isOwner(ctx)) return;
+  try {
+    const res = await callAPI({ action: 'balance' });
+    // Typical SMM response: { balance: "12.34", currency: "USD" }
+    const usd = Number(res.balance || 0);
+    const mmk = usd * USD_TO_MMK;
+    await ctx.reply(
+      codeBlock(`API Balance\nUSD : ${usd.toFixed(2)} ${res.currency || 'USD'}\nMMK : ${fmtMMK(mmk)}`),
+      { parse_mode: 'MarkdownV2', disable_web_page_preview: true }
+    );
+  } catch (e) {
+    await ctx.reply('❌ Failed to fetch balance.', { disable_web_page_preview: true });
+  }
+});
+
+// /orders (group owner) – show recent orders (last 10)
+bot.command('orders', async (ctx) => {
+  if (!isGroup(ctx)) return; // Only meaningful in group per your design
+  if (!isOwner(ctx)) return; // Owner-only in group
+
+  if (DB.orders.length === 0) {
+    return ctx.reply('No orders yet.', { disable_web_page_preview: true });
+  }
+  const list = DB.orders.slice(-10).reverse();
+  const lines = list
+    .map(
+      (o) =>
+        `OrderID : ${o.id || 'undefined'}\nOrderName: ${o.name}\nOrderQty : ${o.qty}\nOrderCost: ${fmtMMK(o.cost_mmk)}\n`
+    )
+    .join('\n');
+  await ctx.reply(codeBlock(lines.trim()), { parse_mode: 'MarkdownV2', disable_web_page_preview: true });
+});
+
+// /orderinfo <number> (group owner) – last N orders with live status
+bot.command('orderinfo', async (ctx) => {
+  if (!isGroup(ctx)) return;
+  if (!isOwner(ctx)) return;
+
+  const text = ctx.message.text || '';
+  const m = text.match(/^\/orderinfo(@\w+)?\s+(\d+)/i);
+  if (!m) {
+    return ctx.reply('Usage: /orderinfo <number>', { disable_web_page_preview: true });
+  }
+  const count = Number(m[2]);
+  const list = getLastNOrders(count);
+  if (list.length === 0) {
+    return ctx.reply('No orders found.', { disable_web_page_preview: true });
+  }
+
+  // Fetch statuses in series (keeps it simple and avoids rate issues)
+  const blocks = [];
+  for (const o of list) {
+    let statusText = 'Unknown';
+    if (!o.id) {
+      statusText = 'Failed (no order id)';
+    } else {
+      try {
+        const res = await callAPI({ action: 'status', order: o.id });
+        // Typical response: { status: 'Pending'|'Processing'|'Completed'|'Canceled', charge: '...', start_count: '...', remains: '...' }
+        statusText = String(res.status || 'Unknown');
+      } catch (_) {
+        statusText = 'Status fetch failed';
+      }
+    }
+    blocks.push(
+      `OrderID   : ${o.id || 'undefined'}\nOrderCost : ${fmtMMK(o.cost_mmk)}\nStatus    : ${statusText}\n`
+    );
+  }
+
+  await ctx.reply(codeBlock(`Last ${list.length} Orders:\n\n` + blocks.join('\n').trim()), {
+    parse_mode: 'MarkdownV2',
+    disable_web_page_preview: true,
+  });
+});
+
+// /add ... (group owner) – single or multiple orders
+bot.command('add', async (ctx) => {
+  if (!isGroup(ctx)) return; // per your design: ordering in group
+  if (!isOwner(ctx)) return; // owner-only
+
+  const text = ctx.message.text || '';
+  const parsed = parseAddCommand(text);
+  if (parsed.error) {
+    return ctx.reply(parsed.error, { disable_web_page_preview: true });
+  }
+
+  const { link, items } = parsed;
+  const receiptLines = [];
+  receiptLines.push('Ordered Successfully✅');
+  receiptLines.push(`Link.           : ${link}`);
+
+  let totalCost = 0;
+  const placedOrders = [];
+
+  for (const it of items) {
+    const prod = DB.products[it.nameKey];
+    if (!prod || !prod.id) {
+      // Missing mapping – treat as failed
+      const cost = 0;
+      receiptLines.push(`OrderName : ${it.displayName}`);
+      receiptLines.push(`OrderID      : undefined`);
+      receiptLines.push(`OrderQty    : ${it.qty}`);
+      receiptLines.push(`OrderCost   : ${fmtMMK(cost)}`);
+      receiptLines.push(''); // spacer
+      // Store failed record (no id)
+      DB.orders.push({
+        id: undefined,
+        name: it.displayName,
+        qty: it.qty,
+        cost_mmk: cost,
+        link,
+        ts: Date.now(),
+      });
+      continue;
+    }
+
+    // Compute cost from custom MMK/1k
+    const pricePer1k = Number(prod.price_mmk_per_1k || 0);
+    const itemCost = pricePer1k > 0 ? calcCostMMK(pricePer1k, it.qty) : 0;
+
+    // Place real order
+    let orderId = undefined;
+    try {
+      const res = await callAPI({
+        action: 'add',
+        service: prod.id,
+        link: link,
+        quantity: it.qty,
+      });
+      // Typical: { order: 123456 }
+      orderId = res.order;
+    } catch (e) {
+      orderId = undefined;
+    }
+
+    // Accumulate receipt
+    receiptLines.push(`OrderName : ${it.displayName}`);
+    receiptLines.push(`OrderID      : ${orderId !== undefined ? orderId : 'undefined'}`);
+    receiptLines.push(`OrderQty    : ${it.qty}`);
+    receiptLines.push(`OrderCost   : ${fmtMMK(itemCost)}`);
+    receiptLines.push('');
+
+    // Store order record
+    DB.orders.push({
+      id: orderId,
+      name: it.displayName,
+      qty: it.qty,
+      cost_mmk: itemCost,
+      link,
+      ts: Date.now(),
+    });
+    placedOrders.push({ orderId, cost: itemCost });
+    totalCost += itemCost;
+  }
+
+  saveDB();
+
+  receiptLines.push(`Total Cost - ${fmtMMK(totalCost)}`);
+
+  await ctx.reply(codeBlock(receiptLines.join('\n')), {
+    parse_mode: 'MarkdownV2',
+    disable_web_page_preview: true, // IMPORTANT: no link preview
+  });
+});
+
+// Fallback for unknown commands (ignore silently in groups if not owner)
+bot.on('text', async (ctx) => {
+  // No-op; helps keep bot quiet unless a command is used.
+});
+
+// Start polling
+bot.launch().then(() => console.log('🤖 Bot started with Telegraf polling'));
+
+// Graceful stop
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
